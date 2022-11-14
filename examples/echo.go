@@ -42,12 +42,13 @@ func main() {
 	// Prepare the configuration of the DTLS connection
 	config := &dtls.Config{
 		Certificates: []tls.Certificate{certificate},
+		MTU:          1400,
 	}
 
-	listener, err := dtls.Listen("udp", addr, config)
+	listener, err := kcp.Listen(addr, config)
 
 	if err != nil {
-		fmt.Println("dtls listen fail,", err)
+		fmt.Println("kcp listen fail,", err)
 		return
 	}
 
@@ -60,19 +61,13 @@ func main() {
 		conn, err := listener.Accept()
 
 		if err != nil {
-			fmt.Println("dtls accept fail,", err)
+			fmt.Println("kcp accept fail,", err)
 			continue
 		}
 
-		sess, err := kcp.NewConn(0, conn.RemoteAddr(), 0, 0, conn)
+		conn.SetNoDelay(1, 10, 2, 1)
 
-		if err != nil {
-			fmt.Println("create kcp fail,", err)
-			continue
-		}
-		sess.SetNoDelay(1, 10, 2, 1)
-
-		go handleConn(sess)
+		go handleConn(conn)
 	}
 
 }

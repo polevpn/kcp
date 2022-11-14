@@ -2,6 +2,7 @@ module github.com/polevpn/kcp
 
 require (
 	github.com/klauspost/reedsolomon v1.10.0
+	github.com/pion/dtls v1.5.4
 	github.com/pion/dtls/v2 v2.1.5
 	github.com/pkg/errors v0.9.1
 	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d

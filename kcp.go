@@ -19,7 +19,7 @@ const (
 	IKCP_ASK_TELL    = 2  // need to send IKCP_CMD_WINS
 	IKCP_WND_SND     = 32
 	IKCP_WND_RCV     = 32
-	IKCP_MTU_DEF     = 1400
+	IKCP_MTU_DEF     = 1350
 	IKCP_ACK_FAST    = 3
 	IKCP_INTERVAL    = 100
 	IKCP_OVERHEAD    = 24

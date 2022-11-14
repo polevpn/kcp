@@ -37,28 +37,24 @@ func main() {
 
 	// Prepare the configuration of the DTLS connection
 	config := &dtls.Config{
-		InsecureSkipVerify: false,
+		InsecureSkipVerify: true,
+		MTU:                1400,
 	}
 	// Connect to a DTLS server
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 	defer cancel()
 
-	dtlsConn, err := dtls.DialWithContext(ctx, "udp", addr, config)
+	conn, err := kcp.DialWithContext(ctx, addr, config)
 
 	if err != nil {
 		fmt.Println("dail fail,", err)
 		return
 	}
-	defer dtlsConn.Close()
+	defer conn.Close()
 
-	sess, err := kcp.NewConn(0, dtlsConn.RemoteAddr(), 0, 0, dtlsConn)
-
-	if err != nil {
-		fmt.Println("create kcp session fail,", err)
-		return
-	}
+	conn.SetNoDelay(1, 20, 2, 1)
 
 	// Simulate a chat session
-	handleConn(sess)
+	handleConn(conn)
 }

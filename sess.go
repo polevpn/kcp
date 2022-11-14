@@ -8,6 +8,7 @@
 package kcp
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/pion/dtls/v2"
 	"github.com/pkg/errors"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -695,4 +697,70 @@ func (s *UDPSession) kcpInput(data []byte) {
 // NewConn establishes a session and talks KCP protocol over a packet connection.
 func NewConn(convid uint32, raddr net.Addr, dataShards, parityShards int, conn net.Conn) (*UDPSession, error) {
 	return newUDPSession(convid, dataShards, parityShards, conn, false, raddr), nil
+}
+
+type KCPListener struct {
+	listener net.Listener
+}
+
+func (kl *KCPListener) Accept() (*UDPSession, error) {
+
+	// Wait for a connection.
+	conn, err := kl.listener.Accept()
+
+	if err != nil {
+		return nil, err
+	}
+
+	sess, err := NewConn(0, conn.RemoteAddr(), 0, 0, conn)
+
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	return sess, nil
+
+}
+
+func (kl *KCPListener) Close() error {
+	return kl.listener.Close()
+}
+
+func (kl *KCPListener) Addr() net.Addr {
+	return kl.listener.Addr()
+}
+
+func Listen(laddr *net.UDPAddr, config *dtls.Config) (*KCPListener, error) {
+
+	kcpListener := &KCPListener{}
+
+	listener, err := dtls.Listen("udp", laddr, config)
+
+	if err != nil {
+		return nil, err
+	}
+
+	kcpListener.listener = listener
+
+	return kcpListener, nil
+
+}
+
+func DialWithContext(ctx context.Context, raddr *net.UDPAddr, config *dtls.Config) (*UDPSession, error) {
+
+	dtlsConn, err := dtls.DialWithContext(ctx, "udp", raddr, config)
+
+	if err != nil {
+		return nil, err
+	}
+
+	sess, err := NewConn(0, dtlsConn.RemoteAddr(), 0, 0, dtlsConn)
+
+	if err != nil {
+		dtlsConn.Close()
+		return nil, err
+	}
+
+	return sess, nil
 }
