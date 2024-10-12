@@ -9,34 +9,22 @@ package kcp
 
 import (
 	"context"
-	"encoding/binary"
+	"crypto/tls"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/pion/dtls/v2"
+	"github.com/pion/dtls/v3"
 	"github.com/pkg/errors"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
 
 const (
-	// 16-bytes nonce for each packet
-	nonceSize = 16
-
-	// 4-bytes packet checksum
-	crcSize = 4
-
-	// overall crypto header size
-	cryptHeaderSize = nonceSize + crcSize
-
 	// maximum packet size
 	mtuLimit = 1500
-
-	// accept backlog
-	acceptBacklog = 128
 )
 
 var (
@@ -60,18 +48,13 @@ func init() {
 type (
 	// UDPSession defines a KCP session implemented by UDP
 	UDPSession struct {
-		conn    net.Conn // the underlying packet connection
-		ownConn bool     // true if we created conn internally, false if provided by caller
-		kcp     *KCP     // KCP ARQ protocol
+		conn net.Conn // the underlying packet connection
+		kcp  *KCP     // KCP ARQ protocol
 
 		// kcp receiving is based on packets
 		// recvbuf turns packets into stream
 		recvbuf []byte
 		bufptr  []byte
-
-		// FEC codec
-		fecDecoder *fecDecoder
-		fecEncoder *fecEncoder
 
 		// settings
 		remote     net.Addr  // remote peer address
@@ -96,9 +79,6 @@ type (
 		socketReadErrorOnce  sync.Once
 		socketWriteErrorOnce sync.Once
 
-		// nonce generator
-		nonce Entropy
-
 		// packets waiting to be sent on wire
 		txqueue []ipv4.Message
 
@@ -119,27 +99,16 @@ type (
 )
 
 // newUDPSession create a new udp session for client or server
-func newUDPSession(conv uint32, dataShards, parityShards int, conn net.Conn, ownConn bool, remote net.Addr) *UDPSession {
+func newUDPSession(conv uint32, conn net.Conn, remote net.Addr) *UDPSession {
 	sess := new(UDPSession)
 	sess.die = make(chan struct{})
-	sess.nonce = new(nonceAES128)
-	sess.nonce.Init()
 	sess.chReadEvent = make(chan struct{}, 1)
 	sess.chWriteEvent = make(chan struct{}, 1)
 	sess.chSocketReadError = make(chan struct{})
 	sess.chSocketWriteError = make(chan struct{})
 	sess.remote = remote
 	sess.conn = conn
-	sess.ownConn = ownConn
 	sess.recvbuf = make([]byte, mtuLimit)
-
-	// FEC codec initialization
-	sess.fecDecoder = newFECDecoder(dataShards, parityShards)
-	sess.fecEncoder = newFECEncoder(dataShards, parityShards, 0)
-
-	if sess.fecEncoder != nil {
-		sess.headerSize += fecHeaderSizePlus2
-	}
 
 	sess.kcp = NewKCP(conv, func(buf []byte, size int) {
 		if size >= IKCP_OVERHEAD+sess.headerSize {
@@ -149,6 +118,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, conn net.Conn, own
 	sess.kcp.ReserveBytes(sess.headerSize)
 
 	go sess.readLoop()
+
 	atomic.AddUint64(&DefaultSnmp.ActiveOpens, 1)
 
 	// start per-session updater
@@ -156,6 +126,7 @@ func newUDPSession(conv uint32, dataShards, parityShards int, conn net.Conn, own
 
 	currestab := atomic.AddUint64(&DefaultSnmp.CurrEstab, 1)
 	maxconn := atomic.LoadUint64(&DefaultSnmp.MaxConn)
+
 	if currestab > maxconn {
 		atomic.CompareAndSwapUint64(&DefaultSnmp.MaxConn, maxconn, currestab)
 	}
@@ -329,9 +300,6 @@ func (s *UDPSession) Close() error {
 		s.uncork()
 		// release pending segments
 		s.kcp.ReleaseTX()
-		if s.fecDecoder != nil {
-			s.fecDecoder.release()
-		}
 		s.mu.Unlock()
 
 		return s.conn.Close()
@@ -490,38 +458,31 @@ func (s *UDPSession) SetWriteBuffer(bytes int) error {
 	return errInvalidOperation
 }
 
-// post-processing for sending a packet from kcp core
-// steps:
-// 1. FEC packet generation
-// 2. CRC32 integrity
-// 3. Encryption
-// 4. TxQueue
 func (s *UDPSession) output(buf []byte) {
 
-	var ecc [][]byte
-
-	// 1. FEC encoding
-	if s.fecEncoder != nil {
-		ecc = s.fecEncoder.encode(buf)
-	}
-
-	// 4. TxQueue
 	var msg ipv4.Message
-	for i := 0; i < s.dup+1; i++ {
-		bts := xmitBuf.Get().([]byte)[:len(buf)]
-		copy(bts, buf)
-		msg.Buffers = [][]byte{bts}
-		msg.Addr = s.remote
-		s.txqueue = append(s.txqueue, msg)
-	}
+	bts := xmitBuf.Get().([]byte)[:len(buf)]
+	copy(bts, buf)
+	msg.Buffers = [][]byte{bts}
+	msg.Addr = s.remote
+	s.txqueue = append(s.txqueue, msg)
 
-	for k := range ecc {
-		bts := xmitBuf.Get().([]byte)[:len(ecc[k])]
-		copy(bts, ecc[k])
-		msg.Buffers = [][]byte{bts}
-		msg.Addr = s.remote
-		s.txqueue = append(s.txqueue, msg)
+}
+
+func (s *UDPSession) tx(txqueue []ipv4.Message) {
+	nbytes := 0
+	npkts := 0
+	for k := range txqueue {
+		if n, err := s.conn.Write(txqueue[k].Buffers[0]); err == nil {
+			nbytes += n
+			npkts++
+		} else {
+			s.notifyWriteError(errors.WithStack(err))
+			break
+		}
 	}
+	atomic.AddUint64(&DefaultSnmp.OutPkts, uint64(npkts))
+	atomic.AddUint64(&DefaultSnmp.OutBytes, uint64(nbytes))
 }
 
 // sess update to trigger protocol
@@ -603,100 +564,46 @@ func (s *UDPSession) packetInput(data []byte) {
 }
 
 func (s *UDPSession) kcpInput(data []byte) {
-	var kcpInErrors, fecErrs, fecRecovered, fecParityShards uint64
 
-	fecFlag := binary.LittleEndian.Uint16(data[4:])
-	if fecFlag == typeData || fecFlag == typeParity { // 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
-		if len(data) >= fecHeaderSizePlus2 {
-			f := fecPacket(data)
-			if f.flag() == typeParity {
-				fecParityShards++
-			}
+	var kcpInErrors uint64
 
-			// lock
-			s.mu.Lock()
-			// if fecDecoder is not initialized, create one with default parameter
-			if s.fecDecoder == nil {
-				s.fecDecoder = newFECDecoder(1, 1)
-			}
-			recovers := s.fecDecoder.decode(f)
-			if f.flag() == typeData {
-				if ret := s.kcp.Input(data[fecHeaderSizePlus2:], true, s.ackNoDelay); ret != 0 {
-					kcpInErrors++
-				}
-			}
-
-			for _, r := range recovers {
-				if len(r) >= 2 { // must be larger than 2bytes
-					sz := binary.LittleEndian.Uint16(r)
-					if int(sz) <= len(r) && sz >= 2 {
-						if ret := s.kcp.Input(r[2:sz], false, s.ackNoDelay); ret == 0 {
-							fecRecovered++
-						} else {
-							kcpInErrors++
-						}
-					} else {
-						fecErrs++
-					}
-				} else {
-					fecErrs++
-				}
-				// recycle the recovers
-				xmitBuf.Put(r)
-			}
-
-			// to notify the readers to receive the data
-			if n := s.kcp.PeekSize(); n > 0 {
-				s.notifyReadEvent()
-			}
-			// to notify the writers
-			waitsnd := s.kcp.WaitSnd()
-			if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
-				s.notifyWriteEvent()
-			}
-
-			s.uncork()
-			s.mu.Unlock()
-		} else {
-			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
-		}
-	} else {
-
-		s.mu.Lock()
-		if ret := s.kcp.Input(data, true, s.ackNoDelay); ret != 0 {
-			kcpInErrors++
-		}
-		if n := s.kcp.PeekSize(); n > 0 {
-			s.notifyReadEvent()
-		}
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
-			s.notifyWriteEvent()
-		}
-		s.uncork()
-		s.mu.Unlock()
+	s.mu.Lock()
+	if ret := s.kcp.Input(data, true, s.ackNoDelay); ret != 0 {
+		kcpInErrors++
 	}
+	if n := s.kcp.PeekSize(); n > 0 {
+		s.notifyReadEvent()
+	}
+	waitsnd := s.kcp.WaitSnd()
+	if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+		s.notifyWriteEvent()
+	}
+	s.uncork()
+	s.mu.Unlock()
 
 	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
 	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
-	if fecParityShards > 0 {
-		atomic.AddUint64(&DefaultSnmp.FECParityShards, fecParityShards)
-	}
+
 	if kcpInErrors > 0 {
 		atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
 	}
-	if fecErrs > 0 {
-		atomic.AddUint64(&DefaultSnmp.FECErrs, fecErrs)
-	}
-	if fecRecovered > 0 {
-		atomic.AddUint64(&DefaultSnmp.FECRecovered, fecRecovered)
-	}
+}
 
+func (s *UDPSession) readLoop() {
+	buf := make([]byte, mtuLimit)
+	for {
+		if n, err := s.conn.Read(buf); err == nil {
+			s.packetInput(buf[:n])
+		} else {
+			s.notifyReadError(errors.WithStack(err))
+			return
+		}
+	}
 }
 
 // NewConn establishes a session and talks KCP protocol over a packet connection.
-func NewConn(convid uint32, raddr net.Addr, dataShards, parityShards int, conn net.Conn) (*UDPSession, error) {
-	return newUDPSession(convid, dataShards, parityShards, conn, false, raddr), nil
+func NewConn(convid uint32, raddr net.Addr, conn net.Conn) *UDPSession {
+	return newUDPSession(convid, conn, raddr)
 }
 
 type KCPListener struct {
@@ -712,12 +619,23 @@ func (kl *KCPListener) Accept() (*UDPSession, error) {
 		return nil, err
 	}
 
-	sess, err := NewConn(0, conn.RemoteAddr(), 0, 0, conn)
+	dtlsConn, ok := conn.(*dtls.Conn)
+	if ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 
-	if err != nil {
-		conn.Close()
-		return nil, err
+		defer cancel()
+
+		err := dtlsConn.HandshakeContext(ctx)
+
+		if err != nil {
+			return nil, err
+		}
+
+	} else {
+		return nil, errors.New("not a dtls conn")
 	}
+
+	sess := NewConn(0, conn.RemoteAddr(), conn)
 
 	return sess, nil
 
@@ -731,7 +649,19 @@ func (kl *KCPListener) Addr() net.Addr {
 	return kl.listener.Addr()
 }
 
-func Listen(laddr *net.UDPAddr, config *dtls.Config) (*KCPListener, error) {
+func Listen(laddr *net.UDPAddr, cert string, key string) (*KCPListener, error) {
+
+	certificate, err := tls.LoadX509KeyPair(cert, key)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Prepare the configuration of the DTLS connection
+	config := &dtls.Config{
+		Certificates: []tls.Certificate{certificate},
+		MTU:          1400,
+	}
 
 	kcpListener := &KCPListener{}
 
@@ -747,20 +677,25 @@ func Listen(laddr *net.UDPAddr, config *dtls.Config) (*KCPListener, error) {
 
 }
 
-func DialWithContext(ctx context.Context, raddr *net.UDPAddr, config *dtls.Config) (*UDPSession, error) {
+func DialWithContext(ctx context.Context, raddr *net.UDPAddr) (*UDPSession, error) {
 
-	dtlsConn, err := dtls.DialWithContext(ctx, "udp", raddr, config)
+	config := &dtls.Config{
+		InsecureSkipVerify: true,
+		MTU:                1400,
+	}
+
+	dtlsConn, err := dtls.Dial("udp", raddr, config)
 
 	if err != nil {
 		return nil, err
 	}
 
-	sess, err := NewConn(0, dtlsConn.RemoteAddr(), 0, 0, dtlsConn)
-
-	if err != nil {
+	if err := dtlsConn.HandshakeContext(ctx); err != nil {
 		dtlsConn.Close()
 		return nil, err
 	}
+
+	sess := NewConn(0, dtlsConn.RemoteAddr(), dtlsConn)
 
 	return sess, nil
 }
