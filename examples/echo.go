@@ -1,9 +1,11 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 
+	"github.com/pion/dtls"
 	"github.com/polevpn/kcp"
 )
 
@@ -30,7 +32,19 @@ func main() {
 	// Prepare the IP to connect to
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4444}
 
-	listener, err := kcp.Listen(addr, "./keys/server.crt", "./keys/server.key")
+	certificate, err := tls.LoadX509KeyPair("./keys/server.crt", "./keys/server.key")
+
+	if err != nil {
+		return
+	}
+
+	// Prepare the configuration of the DTLS connection
+	config := &dtls.Config{
+		Certificates: []tls.Certificate{certificate},
+		MTU:          1400,
+	}
+
+	listener, err := kcp.Listen(addr, config)
 
 	if err != nil {
 		fmt.Println("kcp listen fail,", err)

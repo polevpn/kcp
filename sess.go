@@ -9,7 +9,6 @@ package kcp
 
 import (
 	"context"
-	"crypto/tls"
 	"io"
 	"net"
 	"sync"
@@ -649,19 +648,7 @@ func (kl *KCPListener) Addr() net.Addr {
 	return kl.listener.Addr()
 }
 
-func Listen(laddr *net.UDPAddr, cert string, key string) (*KCPListener, error) {
-
-	certificate, err := tls.LoadX509KeyPair(cert, key)
-
-	if err != nil {
-		return nil, err
-	}
-
-	// Prepare the configuration of the DTLS connection
-	config := &dtls.Config{
-		Certificates: []tls.Certificate{certificate},
-		MTU:          1400,
-	}
+func Listen(laddr *net.UDPAddr, config *dtls.Config) (*KCPListener, error) {
 
 	kcpListener := &KCPListener{}
 
@@ -677,12 +664,7 @@ func Listen(laddr *net.UDPAddr, cert string, key string) (*KCPListener, error) {
 
 }
 
-func DialWithContext(ctx context.Context, raddr *net.UDPAddr) (*UDPSession, error) {
-
-	config := &dtls.Config{
-		InsecureSkipVerify: true,
-		MTU:                1400,
-	}
+func DialWithContext(ctx context.Context, raddr *net.UDPAddr, config *dtls.Config) (*UDPSession, error) {
 
 	dtlsConn, err := dtls.Dial("udp", raddr, config)
 
