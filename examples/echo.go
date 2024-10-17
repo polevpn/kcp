@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/pion/dtls"
+	"github.com/pion/dtls/v3"
 	"github.com/polevpn/kcp"
 )
 
@@ -14,16 +14,14 @@ func handleConn(sess *kcp.UDPSession) {
 	for {
 
 		buf := make([]byte, 4096)
-		n, err := sess.Read(buf)
+		_, err := sess.Read(buf)
 
 		if err != nil {
 			fmt.Println("read fail,err=", err)
 			break
 		}
 
-		fmt.Println(string(buf[:n]))
-		sess.Write(buf[:n])
-
+		sess.Write([]byte("2"))
 	}
 
 }
@@ -64,9 +62,9 @@ func main() {
 			continue
 		}
 
-		conn.SetNoDelay(1, 10, 2, 1)
+		conn.SetNoDelay(1, 10, 2, 0)
+		conn.SetWindowSize(4096, 4096)
 
 		go handleConn(conn)
 	}
-
 }

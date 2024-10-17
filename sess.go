@@ -217,7 +217,8 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 
 		// make sure write do not overflow the max sliding window on both side
 		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+
+		if waitsnd < int(s.kcp.snd_wnd) {
 			for _, b := range v {
 				n += len(b)
 				for {
@@ -232,7 +233,8 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 			}
 
 			waitsnd = s.kcp.WaitSnd()
-			if waitsnd >= int(s.kcp.snd_wnd) || waitsnd >= int(s.kcp.rmt_wnd) || !s.writeDelay {
+
+			if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
 				s.kcp.flush(false)
 				s.uncork()
 			}
@@ -367,17 +369,6 @@ func (s *UDPSession) SetMtu(mtu int) bool {
 	defer s.mu.Unlock()
 	s.kcp.SetMtu(mtu)
 	return true
-}
-
-// SetStreamMode toggles the stream mode on/off
-func (s *UDPSession) SetStreamMode(enable bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if enable {
-		s.kcp.stream = 1
-	} else {
-		s.kcp.stream = 0
-	}
 }
 
 // SetACKNoDelay changes ack flush option, set true to flush ack immediately,

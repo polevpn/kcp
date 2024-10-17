@@ -37,6 +37,8 @@ var refTime time.Time = time.Now()
 // currentMs returns current elapsed monotonic milliseconds since program startup
 func currentMs() uint32 { return uint32(time.Since(refTime) / time.Millisecond) }
 
+func currentMricos() uint64 { return uint64(time.Since(refTime) / time.Microsecond) }
+
 // output_callback is a prototype which ought capture conn and call conn.Write
 type output_callback func(buf []byte, size int)
 
@@ -131,19 +133,19 @@ func (seg *segment) encode(ptr []byte) []byte {
 
 // KCP defines a single KCP connection
 type KCP struct {
-	conv, mtu, mss, state                  uint32
-	snd_una, snd_nxt, rcv_nxt              uint32
-	ssthresh                               uint32
-	rx_rttvar, rx_srtt                     int32
-	rx_rto, rx_minrto                      uint32
-	snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe uint32
-	interval, ts_flush                     uint32
-	nodelay, updated                       uint32
-	ts_probe, probe_wait                   uint32
-	dead_link, incr                        uint32
+	conv, mtu, mss, state                               uint32
+	snd_una, snd_nxt, rcv_nxt                           uint32
+	ssthresh                                            uint32
+	rx_rttvar, rx_srtt                                  int32
+	rx_rto, rx_minrto                                   uint32
+	snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe, pacing_rate uint32
+	interval, ts_flush                                  uint32
+	nodelay, updated                                    uint32
+	ts_probe, probe_wait                                uint32
+	dead_link, incr                                     uint32
 
-	fastresend     int32
-	nocwnd, stream int32
+	fastresend int32
+	nocwnd     int32
 
 	snd_queue []segment
 	rcv_queue []segment
@@ -155,6 +157,7 @@ type KCP struct {
 	buffer   []byte
 	reserved int
 	output   output_callback
+	bbr      *BBRStateMachine
 }
 
 type ackItem struct {
@@ -183,6 +186,7 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.ssthresh = IKCP_THRESH_INIT
 	kcp.dead_link = IKCP_DEADLINK
 	kcp.output = output
+	kcp.bbr = newBBRStateMachine(kcp.mss)
 	return kcp
 }
 
@@ -221,22 +225,9 @@ func (kcp *KCP) PeekSize() (length int) {
 	}
 
 	seg := &kcp.rcv_queue[0]
-	if seg.frg == 0 {
-		return len(seg.data)
-	}
 
-	if len(kcp.rcv_queue) < int(seg.frg+1) {
-		return -1
-	}
+	return len(seg.data)
 
-	for k := range kcp.rcv_queue {
-		seg := &kcp.rcv_queue[k]
-		length += len(seg.data)
-		if seg.frg == 0 {
-			break
-		}
-	}
-	return
 }
 
 // Receive data from kcp state machine
@@ -266,13 +257,10 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	for k := range kcp.rcv_queue {
 		seg := &kcp.rcv_queue[k]
 		copy(buffer, seg.data)
-		buffer = buffer[len(seg.data):]
 		n += len(seg.data)
 		count++
 		kcp.delSegment(seg)
-		if seg.frg == 0 {
-			break
-		}
+		break
 	}
 	if count > 0 {
 		kcp.rcv_queue = kcp.remove_front(kcp.rcv_queue, count)
@@ -312,29 +300,29 @@ func (kcp *KCP) Send(buffer []byte) int {
 	}
 
 	// append to previous segment in streaming mode (if possible)
-	if kcp.stream != 0 {
-		n := len(kcp.snd_queue)
-		if n > 0 {
-			seg := &kcp.snd_queue[n-1]
-			if len(seg.data) < int(kcp.mss) {
-				capacity := int(kcp.mss) - len(seg.data)
-				extend := capacity
-				if len(buffer) < capacity {
-					extend = len(buffer)
-				}
 
-				// grow slice, the underlying cap is guaranteed to
-				// be larger than kcp.mss
-				oldlen := len(seg.data)
-				seg.data = seg.data[:oldlen+extend]
-				copy(seg.data[oldlen:], buffer)
-				buffer = buffer[extend:]
+	n := len(kcp.snd_queue)
+
+	if n > 0 {
+		seg := &kcp.snd_queue[n-1]
+		if len(seg.data) < int(kcp.mss) {
+			capacity := int(kcp.mss) - len(seg.data)
+			extend := capacity
+			if len(buffer) < capacity {
+				extend = len(buffer)
 			}
-		}
 
-		if len(buffer) == 0 {
-			return 0
+			// grow slice, the underlying cap is guaranteed to
+			// be larger than kcp.mss
+			oldlen := len(seg.data)
+			seg.data = seg.data[:oldlen+extend]
+			copy(seg.data[oldlen:], buffer)
+			buffer = buffer[extend:]
 		}
+	}
+
+	if len(buffer) == 0 {
+		return 0
 	}
 
 	if len(buffer) <= int(kcp.mss) {
@@ -360,11 +348,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 		}
 		seg := kcp.newSegment(size)
 		copy(seg.data, buffer[:size])
-		if kcp.stream == 0 { // message mode
-			seg.frg = uint8(count - i - 1)
-		} else { // stream mode
-			seg.frg = 0
-		}
+		seg.frg = 0
 		kcp.snd_queue = append(kcp.snd_queue, seg)
 		buffer = buffer[size:]
 	}
@@ -528,7 +512,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 //
 // 'ackNoDelay' will trigger immediate ACK, but surely it will not be efficient in bandwidth
 func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
-	snd_una := kcp.snd_una
+
 	if len(data) < IKCP_OVERHEAD {
 		return -1
 	}
@@ -581,6 +565,12 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 			kcp.parse_fastack(sn, ts)
 			flag |= 1
 			latest = ts
+			if kcp.nocwnd == 0 {
+				infight := kcp.snd_nxt - kcp.snd_una
+				kcp.bbr.input(latest, infight)
+				kcp.pacing_rate, kcp.cwnd = kcp.bbr.output()
+			}
+
 		} else if cmd == IKCP_CMD_PUSH {
 			repeat := true
 			if _itimediff(sn, kcp.rcv_nxt+kcp.rcv_wnd) < 0 {
@@ -625,35 +615,6 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 		}
 	}
 
-	// cwnd update when packet arrived
-	if kcp.nocwnd == 0 {
-		if _itimediff(kcp.snd_una, snd_una) > 0 {
-			if kcp.cwnd < kcp.rmt_wnd {
-				mss := kcp.mss
-				if kcp.cwnd < kcp.ssthresh {
-					kcp.cwnd++
-					kcp.incr += mss
-				} else {
-					if kcp.incr < mss {
-						kcp.incr = mss
-					}
-					kcp.incr += (mss*mss)/kcp.incr + (mss / 16)
-					if (kcp.cwnd+1)*mss <= kcp.incr {
-						if mss > 0 {
-							kcp.cwnd = (kcp.incr + mss - 1) / mss
-						} else {
-							kcp.cwnd = kcp.incr + mss - 1
-						}
-					}
-				}
-				if kcp.cwnd > kcp.rmt_wnd {
-					kcp.cwnd = kcp.rmt_wnd
-					kcp.incr = kcp.rmt_wnd * mss
-				}
-			}
-		}
-	}
-
 	if windowSlides { // if window has slided, flush
 		kcp.flush(false)
 	} else if ackNoDelay && len(kcp.acklist) > 0 { // ack immediately
@@ -671,6 +632,7 @@ func (kcp *KCP) wnd_unused() uint16 {
 
 // flush pending data
 func (kcp *KCP) flush(ackOnly bool) uint32 {
+
 	var seg segment
 	seg.conv = kcp.conv
 	seg.cmd = IKCP_CMD_ACK
@@ -757,10 +719,18 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	cwnd := _imin_(kcp.snd_wnd, kcp.rmt_wnd)
 	if kcp.nocwnd == 0 {
 		cwnd = _imin_(kcp.cwnd, cwnd)
+		if cwnd == 0 {
+			cwnd = 1
+		}
+	}
+
+	if kcp.pacing_rate == 0 {
+		kcp.pacing_rate = 1024 * 1024
 	}
 
 	// sliding window, controlled by snd_nxt && sna_una+cwnd
 	newSegsCount := 0
+	sendBytesCount := 0
 	for k := range kcp.snd_queue {
 		if _itimediff(kcp.snd_nxt, kcp.snd_una+cwnd) >= 0 {
 			break
@@ -772,6 +742,13 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		kcp.snd_buf = append(kcp.snd_buf, newseg)
 		kcp.snd_nxt++
 		newSegsCount++
+		sendBytesCount += int(kcp.mss)
+		if kcp.nocwnd == 0 {
+			if uint32(sendBytesCount) > kcp.pacing_rate {
+				time.Sleep(time.Millisecond)
+				sendBytesCount = 0
+			}
+		}
 	}
 	if newSegsCount > 0 {
 		kcp.snd_queue = kcp.remove_front(kcp.snd_queue, newSegsCount)
@@ -869,36 +846,6 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		atomic.AddUint64(&DefaultSnmp.RetransSegs, sum)
 	}
 
-	// cwnd update
-	if kcp.nocwnd == 0 {
-		// update ssthresh
-		// rate halving, https://tools.ietf.org/html/rfc6937
-		if change > 0 {
-			inflight := kcp.snd_nxt - kcp.snd_una
-			kcp.ssthresh = inflight / 2
-			if kcp.ssthresh < IKCP_THRESH_MIN {
-				kcp.ssthresh = IKCP_THRESH_MIN
-			}
-			kcp.cwnd = kcp.ssthresh + resent
-			kcp.incr = kcp.cwnd * kcp.mss
-		}
-
-		// congestion control, https://tools.ietf.org/html/rfc5681
-		if lostSegs > 0 {
-			kcp.ssthresh = cwnd / 2
-			if kcp.ssthresh < IKCP_THRESH_MIN {
-				kcp.ssthresh = IKCP_THRESH_MIN
-			}
-			kcp.cwnd = 1
-			kcp.incr = kcp.mss
-		}
-
-		if kcp.cwnd < 1 {
-			kcp.cwnd = 1
-			kcp.incr = kcp.mss
-		}
-	}
-
 	return uint32(minrto)
 }
 
@@ -908,6 +855,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 // ikcp_check when to call it again (without ikcp_input/_send calling).
 // 'current' - current timestamp in millisec.
 func (kcp *KCP) Update() {
+
 	var slap int32
 
 	current := currentMs()
@@ -1000,6 +948,7 @@ func (kcp *KCP) SetMtu(mtu int) int {
 	kcp.mtu = uint32(mtu)
 	kcp.mss = kcp.mtu - IKCP_OVERHEAD - uint32(kcp.reserved)
 	kcp.buffer = buffer
+	kcp.bbr.setMss(kcp.mss)
 	return 0
 }
 
