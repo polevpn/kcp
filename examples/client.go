@@ -14,7 +14,7 @@ func handleConn(sess *kcp.UDPSession) {
 
 	count := 0
 
-	time1 := time.Now().Unix()
+	time1 := time.Now().UnixNano()
 	bytes := 0
 
 	for {
@@ -34,23 +34,25 @@ func handleConn(sess *kcp.UDPSession) {
 		count++
 
 		if count > 100000 {
-			sess.Close()
 			break
 		}
 
-		//time.Sleep(time.Second * 1)
-
 	}
 
-	time2 := time.Now().Unix()
+	time2 := time.Now().UnixNano()
 
-	fmt.Println("rate=", int64(bytes)/(time2-time1))
+	timeSpan := float64((time2 - time1)) / float64(1000000000)
+
+	fmt.Println("total=", bytes, "time=", timeSpan, "rate=", uint64(float64(bytes)/timeSpan))
+
+	time.Sleep(time.Second * 8)
+	sess.Close()
 
 }
 
 func main() {
 	// Prepare the IP to connect to
-	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4444}
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8888}
 
 	config := &dtls.Config{
 		InsecureSkipVerify: true,
@@ -58,7 +60,7 @@ func main() {
 	}
 
 	// Connect to a DTLS server
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 
 	defer cancel()
 
@@ -70,8 +72,9 @@ func main() {
 	}
 	defer conn.Close()
 
-	conn.SetNoDelay(1, 20, 2, 0)
-	conn.SetWindowSize(4096, 4096)
+	conn.SetNoDelay(1, 10, 2, 1)
+	conn.SetWindowSize(32, 32)
+	conn.SetACKNoDelay(true)
 
 	fmt.Println("connected")
 

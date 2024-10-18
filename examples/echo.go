@@ -11,24 +11,29 @@ import (
 
 func handleConn(sess *kcp.UDPSession) {
 
+	defer sess.Close()
+
+	bytes := 0
 	for {
 
 		buf := make([]byte, 4096)
-		_, err := sess.Read(buf)
+		n, err := sess.Read(buf)
 
 		if err != nil {
 			fmt.Println("read fail,err=", err)
 			break
 		}
-
+		bytes += n
 		sess.Write([]byte("2"))
 	}
+
+	fmt.Println("bytes=", bytes)
 
 }
 
 func main() {
 	// Prepare the IP to connect to
-	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 4444}
+	addr := &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: 8888}
 
 	certificate, err := tls.LoadX509KeyPair("./keys/server.crt", "./keys/server.key")
 
@@ -62,8 +67,9 @@ func main() {
 			continue
 		}
 
-		conn.SetNoDelay(1, 10, 2, 0)
-		conn.SetWindowSize(4096, 4096)
+		conn.SetNoDelay(1, 10, 2, 1)
+		conn.SetWindowSize(32, 32)
+		conn.SetACKNoDelay(true)
 
 		go handleConn(conn)
 	}

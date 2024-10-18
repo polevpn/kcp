@@ -135,9 +135,23 @@ func newUDPSession(conv uint32, conn net.Conn, remote net.Addr) *UDPSession {
 
 // Read implements net.Conn
 func (s *UDPSession) Read(b []byte) (n int, err error) {
+RESET_TIMER:
+	var timeout *time.Timer
+	// deadline for current reading operation
+	var c <-chan time.Time
+	if !s.rd.IsZero() {
+		delay := time.Until(s.rd)
+		timeout = time.NewTimer(delay)
+		c = timeout.C
+		defer timeout.Stop()
+	}
+
 	for {
 		s.mu.Lock()
-		if len(s.bufptr) > 0 { // copy from buffer into b
+		// bufptr points to the current position of recvbuf,
+		// if previous 'b' is insufficient to accommodate the data, the
+		// remaining data will be stored in bufptr for next read.
+		if len(s.bufptr) > 0 {
 			n = copy(b, s.bufptr)
 			s.bufptr = s.bufptr[n:]
 			s.mu.Unlock()
@@ -146,48 +160,42 @@ func (s *UDPSession) Read(b []byte) (n int, err error) {
 		}
 
 		if size := s.kcp.PeekSize(); size > 0 { // peek data size from kcp
-			if len(b) >= size { // receive data into 'b' directly
+			// if 'b' is large enough to accommodate the data, read directly
+			// from kcp.recv() to 'b', like 'DMA'.
+			if len(b) >= size {
 				s.kcp.Recv(b)
 				s.mu.Unlock()
 				atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(size))
 				return size, nil
 			}
 
-			// if necessary resize the stream buffer to guarantee a sufficient buffer space
+			// otherwise, read to recvbuf first, then copy to 'b'.
+			// dynamically adjust the buffer size to the maximum of 'packet size' when necessary.
 			if cap(s.recvbuf) < size {
+				// usually recvbuf has a size of maximum packet size
 				s.recvbuf = make([]byte, size)
 			}
 
 			// resize the length of recvbuf to correspond to data size
 			s.recvbuf = s.recvbuf[:size]
-			s.kcp.Recv(s.recvbuf)
-			n = copy(b, s.recvbuf)   // copy to 'b'
+			s.kcp.Recv(s.recvbuf)    // read data to recvbuf first
+			n = copy(b, s.recvbuf)   // then copy bytes to 'b' as many as possible
 			s.bufptr = s.recvbuf[n:] // pointer update
+
 			s.mu.Unlock()
 			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
 			return n, nil
 		}
 
-		// deadline for current reading operation
-		var timeout *time.Timer
-		var c <-chan time.Time
-		if !s.rd.IsZero() {
-			if time.Now().After(s.rd) {
-				s.mu.Unlock()
-				return 0, errors.WithStack(errTimeout)
-			}
-
-			delay := time.Until(s.rd)
-			timeout = time.NewTimer(delay)
-			c = timeout.C
-		}
 		s.mu.Unlock()
 
-		// wait for read event or timeout or error
+		// if it runs here, that means we have to block the call, and wait until the
+		// next data packet arrives.
 		select {
 		case <-s.chReadEvent:
 			if timeout != nil {
 				timeout.Stop()
+				goto RESET_TIMER
 			}
 		case <-c:
 			return 0, errors.WithStack(errTimeout)
@@ -204,7 +212,18 @@ func (s *UDPSession) Write(b []byte) (n int, err error) { return s.WriteBuffers(
 
 // WriteBuffers write a vector of byte slices to the underlying connection
 func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
+RESET_TIMER:
+	var timeout *time.Timer
+	var c <-chan time.Time
+	if !s.wd.IsZero() {
+		delay := time.Until(s.wd)
+		timeout = time.NewTimer(delay)
+		c = timeout.C
+		defer timeout.Stop()
+	}
+
 	for {
+		// check for connection close and socket error
 		select {
 		case <-s.chSocketWriteError:
 			return 0, s.socketWriteError.Load().(error)
@@ -217,10 +236,12 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 
 		// make sure write do not overflow the max sliding window on both side
 		waitsnd := s.kcp.WaitSnd()
-
+		//fmt.Println("w=", waitsnd, "sw=", s.kcp.snd_wnd, "rw=", s.kcp.rmt_wnd)
 		if waitsnd < int(s.kcp.snd_wnd) {
+			// transmit all data sequentially, make sure every packet size is within 'mss'
 			for _, b := range v {
 				n += len(b)
+				// handle each slice for packet splitting
 				for {
 					if len(b) <= int(s.kcp.mss) {
 						s.kcp.Send(b)
@@ -233,33 +254,26 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 			}
 
 			waitsnd = s.kcp.WaitSnd()
-
-			if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
+			if waitsnd >= int(s.kcp.snd_wnd) || waitsnd >= int(s.kcp.rmt_wnd) || !s.writeDelay {
+				// put the packets on wire immediately if the inflight window is full
+				// or if we've specified write no delay(NO merging of outgoing bytes)
+				// we don't have to wait until the periodical update() procedure uncorks.
 				s.kcp.flush(false)
-				s.uncork()
 			}
 			s.mu.Unlock()
 			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
 			return n, nil
 		}
 
-		var timeout *time.Timer
-		var c <-chan time.Time
-		if !s.wd.IsZero() {
-			if time.Now().After(s.wd) {
-				s.mu.Unlock()
-				return 0, errors.WithStack(errTimeout)
-			}
-			delay := time.Until(s.wd)
-			timeout = time.NewTimer(delay)
-			c = timeout.C
-		}
 		s.mu.Unlock()
 
+		// if it runs here, that means we have to block the call, and wait until the
+		// transmit buffer to become available again.
 		select {
 		case <-s.chWriteEvent:
 			if timeout != nil {
 				timeout.Stop()
+				goto RESET_TIMER
 			}
 		case <-c:
 			return 0, errors.WithStack(errTimeout)
@@ -483,7 +497,7 @@ func (s *UDPSession) update() {
 		s.mu.Lock()
 		interval := s.kcp.flush(false)
 		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+		if waitsnd < int(s.kcp.snd_wnd) {
 			s.notifyWriteEvent()
 		}
 		s.uncork()

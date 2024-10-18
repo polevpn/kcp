@@ -12,16 +12,15 @@ const (
 )
 
 const (
-	MAX_RTT_SAMPLE_COUNT = 20
-	MAX_BW_SAMPLE_COUNT  = 20
+	MAX_RTT_SAMPLE_COUNT = 3
+	MAX_BW_SAMPLE_COUNT  = 3
 	BW_DELTA_RATIO       = 0.01
 	MAX_RTT_PROBE_TIME   = 10000
 	MAX_START_RESET_TIME = 10000
 
-	CONGESTION_RTT_RATIO = 1.3
+	CONGESTION_RTT_RATIO = 1.5
 	CWND_START_UP_RATIO  = 2
-	CWND_DRAIN_RATIO     = 0.75
-	CWND_BW_PROBE_RATIO  = 1.05
+	CWND_DRAIN_RATIO     = 0.5
 	CWND_RTT_PROBE_RATIO = 0.5
 )
 
@@ -46,9 +45,10 @@ type BBRStateMachine struct {
 func newBBRStateMachine(mss uint32) *BBRStateMachine {
 
 	return &BBRStateMachine{
-		state:    BBR_START_UP,
-		mss:      mss,
-		sampleBw: 0,
+		state:     BBR_START_UP,
+		mss:       mss,
+		sampleBw:  0,
+		sampleRtt: 0,
 	}
 }
 
@@ -132,13 +132,13 @@ func (bsm *BBRStateMachine) startup(ts uint32) {
 		bsm.maxBw = bw
 	}
 
-	bsm.cwnd = bsm.cwnd * 2
+	bsm.cwnd = uint32(float64(bsm.cwnd) * float64(CWND_START_UP_RATIO))
 	bsm.paceRate = uint32((1024 * 1024 * 1024) / 8)
 	if bsm.cwnd < 4 {
 		bsm.cwnd = 4
 	}
 
-	fmt.Println(bsm.delivered, interval, bsm.delivered/interval, bsm.estimateRtt, bsm.minRtt, bsm.estimateBw, bsm.maxBw)
+	//fmt.Println(bsm.delivered, interval, bsm.delivered/interval, bsm.estimateRtt, bsm.minRtt, bsm.estimateBw, bsm.maxBw)
 
 	if bsm.minRtt*CONGESTION_RTT_RATIO < bsm.estimateRtt && bsm.maxBw > bsm.estimateBw*(1-BW_DELTA_RATIO) && bsm.maxBw < bsm.estimateBw*(1+BW_DELTA_RATIO) {
 		fmt.Println("to draining")
@@ -214,16 +214,16 @@ func (bsm *BBRStateMachine) probeBW(ts uint32, inFlight uint32) {
 	bsm.cwnd = uint32(float64(bsm.maxBw)*ratio*float64(bsm.minRtt)) / bsm.mss
 	bsm.paceRate = uint32(float64(bsm.maxBw) * ratio)
 
-	if bsm.minRtt*CONGESTION_RTT_RATIO < bsm.estimateRtt && float64(inFlight*bsm.mss) > bsm.maxBw {
-		bsm.state = BBR_PROBE_RTT
-		fmt.Println("to probe_rtt")
-		bsm.start = 0
-		bsm.delivered = 0
-		bsm.rttProbe = false
-		bsm.sampleBw = 0
-		bsm.sampleRtt = 0
+	// if float64(inFlight*bsm.mss) > bsm.maxBw {
+	// 	bsm.state = BBR_PROBE_RTT
+	// 	fmt.Println("to probe_rtt")
+	// 	bsm.start = 0
+	// 	bsm.delivered = 0
+	// 	bsm.rttProbe = false
+	// 	bsm.sampleBw = 0
+	// 	bsm.sampleRtt = 0
 
-	}
+	// }
 
 }
 
@@ -235,23 +235,6 @@ func (bsm *BBRStateMachine) probeRTT(ts uint32) {
 
 	rtt := float64(curTime-uint64(ts*1000)) / float64(1000)
 
-	if curTime-bsm.start > MAX_RTT_PROBE_TIME*1000 && bsm.rttProbe {
-		fmt.Println("to probe_bw")
-		bsm.state = BBR_PROBE_BW
-		bsm.start = curTime
-		bsm.delivered = 0
-		bsm.sampleBw = 0
-		bsm.sampleRtt = 0
-	} else if curTime-bsm.start > MAX_RTT_PROBE_TIME*1000 && !bsm.rttProbe {
-		bsm.state = BBR_START_UP
-		fmt.Println("to start_up")
-		bsm.start = curTime
-		bsm.delivered = 0
-		bsm.minRtt = 0
-		bsm.sampleBw = 0
-		bsm.sampleRtt = 0
-	}
-
 	if rtt <= bsm.minRtt {
 		bsm.minRtt = rtt
 		bsm.rttProbe = true
@@ -260,5 +243,22 @@ func (bsm *BBRStateMachine) probeRTT(ts uint32) {
 	bsm.cwnd = uint32(float64(bsm.maxBw)*CWND_RTT_PROBE_RATIO*float64(bsm.minRtt)) / bsm.mss
 
 	bsm.paceRate = uint32(float64(bsm.maxBw) * CWND_RTT_PROBE_RATIO)
+
+	if curTime-bsm.start > MAX_RTT_PROBE_TIME*1000 && bsm.rttProbe {
+		fmt.Println("to probe_bw")
+		bsm.state = BBR_PROBE_BW
+		bsm.start = 0
+		bsm.delivered = 0
+		bsm.sampleBw = 0
+		bsm.sampleRtt = 0
+	} else if curTime-bsm.start > MAX_RTT_PROBE_TIME*1000 && !bsm.rttProbe {
+		bsm.state = BBR_START_UP
+		fmt.Println("to start_up")
+		bsm.start = 0
+		bsm.delivered = 0
+		bsm.minRtt = 0
+		bsm.sampleBw = 0
+		bsm.sampleRtt = 0
+	}
 
 }

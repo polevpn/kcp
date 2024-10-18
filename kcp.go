@@ -718,10 +718,11 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	// calculate window size
 	cwnd := _imin_(kcp.snd_wnd, kcp.rmt_wnd)
 	if kcp.nocwnd == 0 {
-		cwnd = _imin_(kcp.cwnd, cwnd)
-		if cwnd == 0 {
-			cwnd = 1
-		}
+		cwnd = kcp.cwnd
+	}
+
+	if cwnd == 0 {
+		cwnd = 1
 	}
 
 	if kcp.pacing_rate == 0 {
@@ -745,7 +746,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		sendBytesCount += int(kcp.mss)
 		if kcp.nocwnd == 0 {
 			if uint32(sendBytesCount) > kcp.pacing_rate {
-				time.Sleep(time.Millisecond)
+				time.Sleep(time.Microsecond * 500)
 				sendBytesCount = 0
 			}
 		}
