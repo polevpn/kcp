@@ -140,9 +140,9 @@ type KCP struct {
 	rx_rto, rx_minrto                                   uint32
 	snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe, pacing_rate uint32
 	interval, ts_flush                                  uint32
-	nodelay, updated                                    uint32
+	nodelay                                             uint32
 	ts_probe, probe_wait                                uint32
-	dead_link, incr                                     uint32
+	dead_link                                           uint32
 
 	fastresend int32
 	nocwnd     int32
@@ -238,6 +238,7 @@ func (kcp *KCP) PeekSize() (length int) {
 //
 // Return -2 if len(buffer) is smaller than kcp.PeekSize().
 func (kcp *KCP) Recv(buffer []byte) (n int) {
+
 	peeksize := kcp.PeekSize()
 	if peeksize < 0 {
 		return -1
@@ -329,10 +330,6 @@ func (kcp *KCP) Send(buffer []byte) int {
 		count = 1
 	} else {
 		count = (len(buffer) + int(kcp.mss) - 1) / int(kcp.mss)
-	}
-
-	if count > 255 {
-		return -2
 	}
 
 	if count == 0 {
@@ -713,6 +710,10 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		ptr = seg.encode(ptr)
 	}
 
+	if (kcp.probe&IKCP_ASK_SEND) != 0 || (kcp.probe&IKCP_ASK_TELL) != 0 {
+		flushBuffer()
+	}
+
 	kcp.probe = 0
 
 	// calculate window size
@@ -726,9 +727,10 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	}
 
 	if kcp.pacing_rate == 0 {
-		kcp.pacing_rate = 1024 * 1024
+		kcp.pacing_rate = 1024 * 1024 * 1024
 	}
 
+	//fmt.Println("nxt=", kcp.snd_nxt, "una=", kcp.snd_una, "cwnd=", cwnd, "rwnd=", kcp.rmt_wnd)
 	// sliding window, controlled by snd_nxt && sna_una+cwnd
 	newSegsCount := 0
 	sendBytesCount := 0
@@ -746,7 +748,7 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		sendBytesCount += int(kcp.mss)
 		if kcp.nocwnd == 0 {
 			if uint32(sendBytesCount) > kcp.pacing_rate {
-				time.Sleep(time.Microsecond * 500)
+				time.Sleep(time.Microsecond * 100)
 				sendBytesCount = 0
 			}
 		}
@@ -850,89 +852,6 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	return uint32(minrto)
 }
 
-// (deprecated)
-//
-// Update updates state (call it repeatedly, every 10ms-100ms), or you can ask
-// ikcp_check when to call it again (without ikcp_input/_send calling).
-// 'current' - current timestamp in millisec.
-func (kcp *KCP) Update() {
-
-	var slap int32
-
-	current := currentMs()
-	if kcp.updated == 0 {
-		kcp.updated = 1
-		kcp.ts_flush = current
-	}
-
-	slap = _itimediff(current, kcp.ts_flush)
-
-	if slap >= 10000 || slap < -10000 {
-		kcp.ts_flush = current
-		slap = 0
-	}
-
-	if slap >= 0 {
-		kcp.ts_flush += kcp.interval
-		if _itimediff(current, kcp.ts_flush) >= 0 {
-			kcp.ts_flush = current + kcp.interval
-		}
-		kcp.flush(false)
-	}
-}
-
-// (deprecated)
-//
-// Check determines when should you invoke ikcp_update:
-// returns when you should invoke ikcp_update in millisec, if there
-// is no ikcp_input/_send calling. you can call ikcp_update in that
-// time, instead of call update repeatly.
-// Important to reduce unnacessary ikcp_update invoking. use it to
-// schedule ikcp_update (eg. implementing an epoll-like mechanism,
-// or optimize ikcp_update when handling massive kcp connections)
-func (kcp *KCP) Check() uint32 {
-	current := currentMs()
-	ts_flush := kcp.ts_flush
-	tm_flush := int32(0x7fffffff)
-	tm_packet := int32(0x7fffffff)
-	minimal := uint32(0)
-	if kcp.updated == 0 {
-		return current
-	}
-
-	if _itimediff(current, ts_flush) >= 10000 ||
-		_itimediff(current, ts_flush) < -10000 {
-		ts_flush = current
-	}
-
-	if _itimediff(current, ts_flush) >= 0 {
-		return current
-	}
-
-	tm_flush = _itimediff(ts_flush, current)
-
-	for k := range kcp.snd_buf {
-		seg := &kcp.snd_buf[k]
-		diff := _itimediff(seg.resendts, current)
-		if diff <= 0 {
-			return current
-		}
-		if diff < tm_packet {
-			tm_packet = diff
-		}
-	}
-
-	minimal = uint32(tm_packet)
-	if tm_packet >= tm_flush {
-		minimal = uint32(tm_flush)
-	}
-	if minimal >= kcp.interval {
-		minimal = kcp.interval
-	}
-
-	return current + minimal
-}
-
 // SetMtu changes MTU size, default is 1400
 func (kcp *KCP) SetMtu(mtu int) int {
 	if mtu < 50 || mtu < IKCP_OVERHEAD {
@@ -943,9 +862,7 @@ func (kcp *KCP) SetMtu(mtu int) int {
 	}
 
 	buffer := make([]byte, mtu)
-	if buffer == nil {
-		return -2
-	}
+
 	kcp.mtu = uint32(mtu)
 	kcp.mss = kcp.mtu - IKCP_OVERHEAD - uint32(kcp.reserved)
 	kcp.buffer = buffer

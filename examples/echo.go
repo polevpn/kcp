@@ -24,7 +24,6 @@ func handleConn(sess *kcp.UDPSession) {
 			break
 		}
 		bytes += n
-		sess.Write([]byte("2"))
 	}
 
 	fmt.Println("bytes=", bytes)
@@ -67,8 +66,8 @@ func main() {
 			continue
 		}
 
-		conn.SetNoDelay(1, 10, 2, 1)
-		conn.SetWindowSize(32, 32)
+		conn.SetNoDelay(1, 10, 2, 0)
+		conn.SetWindowSize(128, 128)
 		conn.SetACKNoDelay(true)
 
 		go handleConn(conn)

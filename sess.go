@@ -158,7 +158,6 @@ RESET_TIMER:
 			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
 			return n, nil
 		}
-
 		if size := s.kcp.PeekSize(); size > 0 { // peek data size from kcp
 			// if 'b' is large enough to accommodate the data, read directly
 			// from kcp.recv() to 'b', like 'DMA'.
@@ -236,8 +235,7 @@ RESET_TIMER:
 
 		// make sure write do not overflow the max sliding window on both side
 		waitsnd := s.kcp.WaitSnd()
-		//fmt.Println("w=", waitsnd, "sw=", s.kcp.snd_wnd, "rw=", s.kcp.rmt_wnd)
-		if waitsnd < int(s.kcp.snd_wnd) {
+		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
 			// transmit all data sequentially, make sure every packet size is within 'mss'
 			for _, b := range v {
 				n += len(b)
@@ -285,6 +283,28 @@ RESET_TIMER:
 	}
 }
 
+// sess update to trigger protocol
+func (s *UDPSession) update() {
+	select {
+	case <-s.die:
+	default:
+		s.mu.Lock()
+		interval := s.kcp.flush(false)
+		waitsnd := s.kcp.WaitSnd()
+		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+			s.notifyWriteEvent()
+		}
+
+		if n := s.kcp.PeekSize(); n > 0 {
+			s.notifyReadEvent()
+		}
+		s.uncork()
+		s.mu.Unlock()
+		// self-synchronized timed scheduling
+		SystemTimedSched.Put(s.update, time.Now().Add(time.Duration(interval)*time.Millisecond))
+	}
+}
+
 // uncork sends data in txqueue if there is any
 func (s *UDPSession) uncork() {
 	if len(s.txqueue) > 0 {
@@ -322,6 +342,132 @@ func (s *UDPSession) Close() error {
 	} else {
 		return errors.WithStack(io.ErrClosedPipe)
 	}
+}
+
+func (s *UDPSession) output(buf []byte) {
+
+	var msg ipv4.Message
+	bts := xmitBuf.Get().([]byte)[:len(buf)]
+	copy(bts, buf)
+	msg.Buffers = [][]byte{bts}
+	msg.Addr = s.remote
+	s.txqueue = append(s.txqueue, msg)
+
+}
+
+// packet input stage
+func (s *UDPSession) packetInput(data []byte) {
+
+	if len(data) >= IKCP_OVERHEAD {
+		s.kcpInput(data)
+	}
+}
+
+func (s *UDPSession) kcpInput(data []byte) {
+
+	var kcpInErrors uint64
+
+	s.mu.Lock()
+	if ret := s.kcp.Input(data, true, s.ackNoDelay); ret != 0 {
+		kcpInErrors++
+	}
+	if n := s.kcp.PeekSize(); n > 0 {
+		s.notifyReadEvent()
+	}
+	waitsnd := s.kcp.WaitSnd()
+	if waitsnd < int(s.kcp.snd_wnd) {
+		s.notifyWriteEvent()
+	}
+	s.uncork()
+	s.mu.Unlock()
+
+	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
+	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
+
+	if kcpInErrors > 0 {
+		atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
+	}
+}
+
+func (s *UDPSession) readLoop() {
+	buf := make([]byte, mtuLimit)
+	for {
+		if n, err := s.conn.Read(buf); err == nil {
+			s.packetInput(buf[:n])
+		} else {
+			s.notifyReadError(errors.WithStack(err))
+			return
+		}
+	}
+}
+
+func (s *UDPSession) tx(txqueue []ipv4.Message) {
+	nbytes := 0
+	npkts := 0
+	for k := range txqueue {
+		if n, err := s.conn.Write(txqueue[k].Buffers[0]); err == nil {
+			nbytes += n
+			npkts++
+		} else {
+			s.notifyWriteError(errors.WithStack(err))
+			break
+		}
+	}
+	atomic.AddUint64(&DefaultSnmp.OutPkts, uint64(npkts))
+	atomic.AddUint64(&DefaultSnmp.OutBytes, uint64(nbytes))
+}
+
+// SetDSCP sets the 6bit DSCP field in IPv4 header, or 8bit Traffic Class in IPv6 header.
+//
+// if the underlying connection has implemented `func SetDSCP(int) error`, SetDSCP() will invoke
+// this function instead.
+//
+// It has no effect if it's accepted from Listener.
+func (s *UDPSession) SetDSCP(dscp int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// interface enabled
+	if ts, ok := s.conn.(setDSCP); ok {
+		return ts.SetDSCP(dscp)
+	}
+
+	if nc, ok := s.conn.(net.Conn); ok {
+		var succeed bool
+		if err := ipv4.NewConn(nc).SetTOS(dscp << 2); err == nil {
+			succeed = true
+		}
+		if err := ipv6.NewConn(nc).SetTrafficClass(dscp); err == nil {
+			succeed = true
+		}
+
+		if succeed {
+			return nil
+		}
+	}
+	return errInvalidOperation
+}
+
+// SetReadBuffer sets the socket read buffer, no effect if it's accepted from Listener
+func (s *UDPSession) SetReadBuffer(bytes int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if nc, ok := s.conn.(setReadBuffer); ok {
+		return nc.SetReadBuffer(bytes)
+	}
+
+	return errInvalidOperation
+}
+
+// SetWriteBuffer sets the socket write buffer, no effect if it's accepted from Listener
+func (s *UDPSession) SetWriteBuffer(bytes int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if nc, ok := s.conn.(setWriteBuffer); ok {
+		return nc.SetWriteBuffer(bytes)
+	}
+	return errInvalidOperation
 }
 
 // LocalAddr returns the local network address. The Addr returned is shared by all invocations of LocalAddr, so do not modify it.
@@ -409,104 +555,6 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 	s.kcp.NoDelay(nodelay, interval, resend, nc)
 }
 
-// SetDSCP sets the 6bit DSCP field in IPv4 header, or 8bit Traffic Class in IPv6 header.
-//
-// if the underlying connection has implemented `func SetDSCP(int) error`, SetDSCP() will invoke
-// this function instead.
-//
-// It has no effect if it's accepted from Listener.
-func (s *UDPSession) SetDSCP(dscp int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// interface enabled
-	if ts, ok := s.conn.(setDSCP); ok {
-		return ts.SetDSCP(dscp)
-	}
-
-	if nc, ok := s.conn.(net.Conn); ok {
-		var succeed bool
-		if err := ipv4.NewConn(nc).SetTOS(dscp << 2); err == nil {
-			succeed = true
-		}
-		if err := ipv6.NewConn(nc).SetTrafficClass(dscp); err == nil {
-			succeed = true
-		}
-
-		if succeed {
-			return nil
-		}
-	}
-	return errInvalidOperation
-}
-
-// SetReadBuffer sets the socket read buffer, no effect if it's accepted from Listener
-func (s *UDPSession) SetReadBuffer(bytes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if nc, ok := s.conn.(setReadBuffer); ok {
-		return nc.SetReadBuffer(bytes)
-	}
-
-	return errInvalidOperation
-}
-
-// SetWriteBuffer sets the socket write buffer, no effect if it's accepted from Listener
-func (s *UDPSession) SetWriteBuffer(bytes int) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if nc, ok := s.conn.(setWriteBuffer); ok {
-		return nc.SetWriteBuffer(bytes)
-	}
-	return errInvalidOperation
-}
-
-func (s *UDPSession) output(buf []byte) {
-
-	var msg ipv4.Message
-	bts := xmitBuf.Get().([]byte)[:len(buf)]
-	copy(bts, buf)
-	msg.Buffers = [][]byte{bts}
-	msg.Addr = s.remote
-	s.txqueue = append(s.txqueue, msg)
-
-}
-
-func (s *UDPSession) tx(txqueue []ipv4.Message) {
-	nbytes := 0
-	npkts := 0
-	for k := range txqueue {
-		if n, err := s.conn.Write(txqueue[k].Buffers[0]); err == nil {
-			nbytes += n
-			npkts++
-		} else {
-			s.notifyWriteError(errors.WithStack(err))
-			break
-		}
-	}
-	atomic.AddUint64(&DefaultSnmp.OutPkts, uint64(npkts))
-	atomic.AddUint64(&DefaultSnmp.OutBytes, uint64(nbytes))
-}
-
-// sess update to trigger protocol
-func (s *UDPSession) update() {
-	select {
-	case <-s.die:
-	default:
-		s.mu.Lock()
-		interval := s.kcp.flush(false)
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
-			s.notifyWriteEvent()
-		}
-		s.uncork()
-		s.mu.Unlock()
-		// self-synchronized timed scheduling
-		SystemTimedSched.Put(s.update, time.Now().Add(time.Duration(interval)*time.Millisecond))
-	}
-}
-
 // GetConv gets conversation id of a session
 func (s *UDPSession) GetConv() uint32 { return s.kcp.conv }
 
@@ -557,52 +605,6 @@ func (s *UDPSession) notifyWriteError(err error) {
 		s.socketWriteError.Store(err)
 		close(s.chSocketWriteError)
 	})
-}
-
-// packet input stage
-func (s *UDPSession) packetInput(data []byte) {
-
-	if len(data) >= IKCP_OVERHEAD {
-		s.kcpInput(data)
-	}
-}
-
-func (s *UDPSession) kcpInput(data []byte) {
-
-	var kcpInErrors uint64
-
-	s.mu.Lock()
-	if ret := s.kcp.Input(data, true, s.ackNoDelay); ret != 0 {
-		kcpInErrors++
-	}
-	if n := s.kcp.PeekSize(); n > 0 {
-		s.notifyReadEvent()
-	}
-	waitsnd := s.kcp.WaitSnd()
-	if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
-		s.notifyWriteEvent()
-	}
-	s.uncork()
-	s.mu.Unlock()
-
-	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
-	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
-
-	if kcpInErrors > 0 {
-		atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
-	}
-}
-
-func (s *UDPSession) readLoop() {
-	buf := make([]byte, mtuLimit)
-	for {
-		if n, err := s.conn.Read(buf); err == nil {
-			s.packetInput(buf[:n])
-		} else {
-			s.notifyReadError(errors.WithStack(err))
-			return
-		}
-	}
 }
 
 // NewConn establishes a session and talks KCP protocol over a packet connection.
