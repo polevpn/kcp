@@ -563,8 +563,8 @@ func (kcp *KCP) Input(data []byte, regular, ackNoDelay bool) int {
 			flag |= 1
 			latest = ts
 			if kcp.nocwnd == 0 {
-				infight := kcp.snd_nxt - kcp.snd_una
-				kcp.bbr.input(latest, infight)
+				inflight := kcp.snd_nxt - kcp.snd_una
+				kcp.bbr.input(latest, inflight)
 				kcp.pacing_rate, kcp.cwnd = kcp.bbr.output()
 			}
 

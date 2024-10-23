@@ -235,7 +235,7 @@ RESET_TIMER:
 
 		// make sure write do not overflow the max sliding window on both side
 		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+		if waitsnd < int(s.kcp.snd_wnd) {
 			// transmit all data sequentially, make sure every packet size is within 'mss'
 			for _, b := range v {
 				n += len(b)
@@ -252,7 +252,7 @@ RESET_TIMER:
 			}
 
 			waitsnd = s.kcp.WaitSnd()
-			if waitsnd >= int(s.kcp.snd_wnd) || waitsnd >= int(s.kcp.rmt_wnd) || !s.writeDelay {
+			if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
 				// put the packets on wire immediately if the inflight window is full
 				// or if we've specified write no delay(NO merging of outgoing bytes)
 				// we don't have to wait until the periodical update() procedure uncorks.
@@ -291,7 +291,7 @@ func (s *UDPSession) update() {
 		s.mu.Lock()
 		interval := s.kcp.flush(false)
 		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) && waitsnd < int(s.kcp.rmt_wnd) {
+		if waitsnd < int(s.kcp.snd_wnd) {
 			s.notifyWriteEvent()
 		}
 

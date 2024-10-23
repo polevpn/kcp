@@ -38,7 +38,7 @@ func handleConn(sess *kcp.UDPSession) {
 
 		count++
 
-		if count > 10000 {
+		if count > 500000 {
 			break
 		}
 
